@@ -107,7 +107,12 @@ python3 pve_balloon.py                  # every VM, every verdict
 python3 pve_balloon.py --only yes       # just the ones pvestatd actually manages
 python3 pve_balloon.py --json           # machine-readable, includes unreachable nodes
 python3 pve_balloon.py --full           # adds the runtime guest-driver check (slow)
+python3 pve_balloon.py --only yes --out ballooning.txt
 ```
+
+Per-node progress (`[2/5] pve2: fetching...` and how long each node took) goes to stderr, so
+`--out FILE` — or a plain `> FILE` — keeps the report clean while you still watch it work, and
+the timings tell you which node is the slow one.
 
 Verdicts:
 

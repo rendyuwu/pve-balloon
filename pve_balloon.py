@@ -37,7 +37,9 @@ import argparse
 import json
 import os
 import ssl
+import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +47,11 @@ from pathlib import Path
 
 MIB = 1024 * 1024
 ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+
+def log(msg: str) -> None:
+    """Progress goes to stderr, so --out (or a shell `>`) still gets a clean report."""
+    print(msg, file=sys.stderr, flush=True)
 
 
 def load_dotenv(path: Path = ENV_FILE) -> None:
@@ -131,6 +138,7 @@ def main() -> int:
     ap.add_argument("--full", action="store_true", help="QMP query per running VM (slow)")
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--only", default="", help="print only this verdict, e.g. --only yes")
+    ap.add_argument("--out", help="write the report to this file (progress still goes to stderr)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -157,16 +165,24 @@ def main() -> int:
         return 1
 
     rows, unreachable = [], []
-    for node in sorted(nodes, key=lambda n: n["node"]):
+    total, started = len(nodes), time.monotonic()
+    log(f"{total} node(s)" + (" -- --full does a QMP query per running VM" if args.full else ""))
+    for i, node in enumerate(sorted(nodes, key=lambda n: n["node"]), 1):
         name = node["node"]
+        tag = f"[{i}/{total}] {name}"
         if node.get("status") != "online":
+            log(f"{tag}: skipped, status={node.get('status')}")
             unreachable.append(f"{name} (status={node.get('status')})")
             continue
+        log(f"{tag}: fetching...")
+        t = time.monotonic()
         try:
             vms = get(f"/nodes/{name}/qemu" + ("?full=1" if args.full else ""))
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            log(f"{tag}: FAILED after {time.monotonic() - t:.1f}s -- {exc}")
             unreachable.append(f"{name} ({exc})")
             continue
+        log(f"{tag}: {len(vms)} VM(s) in {time.monotonic() - t:.1f}s")
         for vm in vms:
             if vm.get("template"):
                 continue
@@ -189,25 +205,34 @@ def main() -> int:
 
     if args.only:
         rows = [r for r in rows if r["ballooning"] == args.only]
+    log(f"done in {time.monotonic() - started:.1f}s, {len(rows)} row(s)")
 
-    if args.json:
-        print(json.dumps({"vms": rows, "unreachable": unreachable}, indent=2))
-    else:
-        for r in rows:
+    out = open(args.out, "w") if args.out else sys.stdout
+    try:
+        if args.json:
+            print(json.dumps({"vms": rows, "unreachable": unreachable}, indent=2), file=out)
+        else:
+            for r in rows:
+                print(
+                    f"{r['node']:<12} {r['vmid']:>6}  {r['name'][:24]:<24} "
+                    f"{r['status']:<8} {r['ballooning']:<9} {r['why']}",
+                    file=out,
+                )
+            print(f"\n{len(rows)} VM(s) listed.", file=out)
+
+        # A node we could not read is a gap in the answer, not an absence of ballooning.
+        if unreachable:
+            print("NOT ANSWERED for: " + ", ".join(unreachable), file=out)
+        if not rows and nodes and not args.only:
             print(
-                f"{r['node']:<12} {r['vmid']:>6}  {r['name'][:24]:<24} "
-                f"{r['status']:<8} {r['ballooning']:<9} {r['why']}"
+                "0 VMs across online nodes -- if that is wrong, the API token most likely has "
+                "Privilege Separation on and no VM.Audit ACL, which filters the list silently.",
+                file=out,
             )
-        print(f"\n{len(rows)} VM(s) listed.")
-
-    # A node we could not read is a gap in the answer, not an absence of ballooning.
-    if unreachable:
-        print("NOT ANSWERED for: " + ", ".join(unreachable))
-    if not rows and nodes:
-        print(
-            "0 VMs across online nodes -- if that is wrong, the API token most likely has "
-            "Privilege Separation on and no VM.Audit ACL, which filters the list silently."
-        )
+    finally:
+        if out is not sys.stdout:
+            out.close()
+            log(f"report written to {args.out}")
     return 2 if unreachable else 0
 
 
