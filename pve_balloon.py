@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""List every VM in a Proxmox cluster and say whether memory ballooning is active.
+
+Cost: 1 call for the node list + 1 call per ONLINE node. No per-VM call.
+
+`GET /nodes/{node}/qemu` returns PVE::QemuServer::vmstatus() verbatim (API2/Qemu.pm
+`vmlist` pushes the hash unfiltered), and vmstatus sets `balloon_min` / `shares` from
+the VM config without touching QMP:
+
+    if ($conf->{balloon}) {
+        $d->{balloon_min} = $conf->{balloon} * (1024 * 1024);
+        $d->{shares} = defined($conf->{shares}) ? $conf->{shares} : $defaults->{shares};
+    }
+
+Those two keys are NOT in the endpoint's documented return schema, so treat their
+presence as a fact to confirm once against your own cluster, not as a contract.
+If they are missing on your version, fall back to the pmxcfs read in README-style
+usage below (one ssh, zero API load):
+
+    ssh root@<any-node> 'for f in /etc/pve/nodes/*/qemu-server/*.conf; do \
+        printf "%s " "$f"; sed -n "/^\\[/q;p" "$f" | tr "\\n" " "; echo; done' \
+        | grep -E 'balloon|memory'
+
+`--full` adds `full=1`, which makes the node run a QMP `query-balloon` against every
+running VM. That is the only way to learn whether the guest's balloon driver is
+actually loaded, and it is also the slow path: a wedged VM stalls the whole node's
+answer. Off by default.
+
+Config comes from a `.env` beside this file (see .env.example): PVE_HOST
+("pve1", "pve1:443", "https://pve.example.com"; port defaults to 8006),
+PVE_TOKEN ("user@realm!tokenid=uuid"), optional PVE_INSECURE=1.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import ssl
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+MIB = 1024 * 1024
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+
+def load_dotenv(path: Path = ENV_FILE) -> None:
+    """Read KEY=VALUE lines into os.environ. A variable already exported in the shell
+    wins, so a one-off run against another cluster never needs the file edited."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.removeprefix("export ").lstrip()
+        key, sep, value = line.partition("=")
+        if sep:
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+def base_url(host: str) -> str:
+    """Accept "pve1", "pve1:443", "https://pve.example.com/", "[2001:db8::1]:443".
+
+    Port stays whatever the operator wrote -- a cluster behind a reverse proxy answers
+    on 443, not 8006 -- and only an address with no port of its own gets PVE's default.
+    urlsplit does the IPv6 bracket handling so this does not have to.
+    """
+    parts = urllib.parse.urlsplit(host if "://" in host else f"https://{host}")
+    if not parts.hostname:
+        raise ValueError(f"no host in {host!r}")
+    netloc = parts.netloc if parts.port else f"{parts.netloc}:8006"
+    return f"{parts.scheme}://{netloc}"
+
+
+def api_get(host: str, token: str, path: str, *, insecure: bool, timeout: float) -> object:
+    req = urllib.request.Request(
+        f"{base_url(host)}/api2/json{path}",
+        headers={"Authorization": f"PVEAPIToken={token}"},
+    )
+    ctx = ssl._create_unverified_context() if insecure else None
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        return json.load(resp)["data"]
+
+
+def classify(vm: dict) -> tuple[str, str]:
+    """Return (verdict, why) for one vmstatus entry.
+
+    pvestatd only auto-balloons a VM that clears every test in
+    PVE::AutoBalloon::compute_alg1: balloon driver reporting, `balloon_min` set,
+    not locked for migrate, and `shares` != 0.
+    """
+    maxmem = vm.get("maxmem") or 0
+    floor = vm.get("balloon_min")
+    shares = vm.get("shares")
+    runtime = vm.get("balloon")  # bytes the guest currently holds; only with full=1
+
+    if not floor:
+        # `balloon: 0` (device omitted) and an unset `balloon` (device present, no
+        # floor) both land here -- vmstatus cannot tell them apart. Neither is ever
+        # auto-ballooned, so the distinction only matters if you care about the
+        # device itself; read the VM config or use --full to separate them.
+        return "no", "balloon floor unset in config (or balloon: 0)"
+    if vm.get("lock") == "migrate":
+        return "paused", "locked for migrate; pvestatd skips it"
+    if shares == 0:
+        return "manual", f"shares=0, fixed at {floor // MIB} MiB, no auto-ballooning"
+    if floor >= maxmem:
+        return "no-range", f"floor {floor // MIB} MiB == max {maxmem // MIB} MiB"
+    if runtime is None and "full" in vm:
+        return "no-driver", "balloon device configured but guest driver not reporting"
+    return "yes", f"{floor // MIB}-{maxmem // MIB} MiB, shares={shares if shares is not None else 1000}"
+
+
+def main() -> int:
+    load_dotenv()
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--host", default=os.environ.get("PVE_HOST"))
+    ap.add_argument("--token", default=os.environ.get("PVE_TOKEN"))
+    ap.add_argument(
+        "--insecure",
+        action="store_true",
+        default=os.environ.get("PVE_INSECURE") == "1",
+        help="skip TLS verification (or PVE_INSECURE=1)",
+    )
+    ap.add_argument("--full", action="store_true", help="QMP query per running VM (slow)")
+    ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--only", default="", help="print only this verdict, e.g. --only yes")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
+    if not args.host or not args.token:
+        ap.error(f"need --host/--token, or PVE_HOST/PVE_TOKEN in {ENV_FILE}")
+
+    get = lambda path: api_get(  # noqa: E731
+        args.host, args.token, path, insecure=args.insecure, timeout=args.timeout
+    )
+
+    # The node list is the one call with nothing to fall back on, so it reports its own
+    # failure instead of ending in a traceback: a typo'd token or host lands here first.
+    try:
+        nodes = get("/nodes")
+    except urllib.error.HTTPError as exc:
+        hint = " -- check PVE_TOKEN" if exc.code == 401 else ""
+        print(f"GET /nodes failed: {exc.code} {exc.reason}{hint}")
+        return 1
+    except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError) as exc:
+        print(f"cannot reach {base_url(args.host)}: {exc}")
+        return 1
+
+    rows, unreachable = [], []
+    for node in sorted(nodes, key=lambda n: n["node"]):
+        name = node["node"]
+        if node.get("status") != "online":
+            unreachable.append(f"{name} (status={node.get('status')})")
+            continue
+        try:
+            vms = get(f"/nodes/{name}/qemu" + ("?full=1" if args.full else ""))
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            unreachable.append(f"{name} ({exc})")
+            continue
+        for vm in vms:
+            if vm.get("template"):
+                continue
+            if args.full:
+                vm["full"] = True
+            verdict, why = classify(vm)
+            rows.append(
+                {
+                    "node": name,
+                    "vmid": vm["vmid"],
+                    "name": vm.get("name", ""),
+                    "status": vm.get("status", ""),
+                    "max_mib": (vm.get("maxmem") or 0) // MIB,
+                    "floor_mib": (vm.get("balloon_min") or 0) // MIB or None,
+                    "shares": vm.get("shares"),
+                    "ballooning": verdict,
+                    "why": why,
+                }
+            )
+
+    if args.only:
+        rows = [r for r in rows if r["ballooning"] == args.only]
+
+    if args.json:
+        print(json.dumps({"vms": rows, "unreachable": unreachable}, indent=2))
+    else:
+        for r in rows:
+            print(
+                f"{r['node']:<12} {r['vmid']:>6}  {r['name'][:24]:<24} "
+                f"{r['status']:<8} {r['ballooning']:<9} {r['why']}"
+            )
+        print(f"\n{len(rows)} VM(s) listed.")
+
+    # A node we could not read is a gap in the answer, not an absence of ballooning.
+    if unreachable:
+        print("NOT ANSWERED for: " + ", ".join(unreachable))
+    if not rows and nodes:
+        print(
+            "0 VMs across online nodes -- if that is wrong, the API token most likely has "
+            "Privilege Separation on and no VM.Audit ACL, which filters the list silently."
+        )
+    return 2 if unreachable else 0
+
+
+def selftest() -> int:
+    cases = [
+        ({"maxmem": 4096 * MIB}, "no"),
+        ({"maxmem": 4096 * MIB, "balloon_min": 2048 * MIB, "shares": 1000}, "yes"),
+        ({"maxmem": 4096 * MIB, "balloon_min": 2048 * MIB, "shares": 0}, "manual"),
+        ({"maxmem": 4096 * MIB, "balloon_min": 4096 * MIB, "shares": 1000}, "no-range"),
+        (
+            {"maxmem": 4096 * MIB, "balloon_min": 2048 * MIB, "shares": 1000, "lock": "migrate"},
+            "paused",
+        ),
+        ({"maxmem": 4096 * MIB, "balloon_min": 2048 * MIB, "shares": 1000, "full": True}, "no-driver"),
+        (
+            {
+                "maxmem": 4096 * MIB,
+                "balloon_min": 2048 * MIB,
+                "shares": 1000,
+                "full": True,
+                "balloon": 3000 * MIB,
+            },
+            "yes",
+        ),
+    ]
+    for vm, want in cases:
+        got, why = classify(vm)
+        assert got == want, f"{vm} -> {got!r} ({why}), want {want!r}"
+
+    urls = [
+        ("pve1", "https://pve1:8006"),
+        ("pve1:443", "https://pve1:443"),
+        ("https://pve.example.com", "https://pve.example.com:8006"),
+        ("https://pve.example.com:443/", "https://pve.example.com:443"),
+        ("[2001:db8::1]", "https://[2001:db8::1]:8006"),
+        ("[2001:db8::1]:443", "https://[2001:db8::1]:443"),
+    ]
+    for host, want in urls:
+        got = base_url(host)
+        assert got == want, f"{host!r} -> {got!r}, want {want!r}"
+
+    with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as fh:
+        fh.write(
+            "# comment\n\n"
+            "export PVE_HOST='pve9.example.com:443'\n"
+            "PVE_TOKEN=\"me@pve!ro=deadbeef\"\n"
+            "PVE_INSECURE=1\n"
+            "not-a-pair\n"
+        )
+        env_path = Path(fh.name)
+    os.environ.pop("PVE_HOST", None)
+    os.environ["PVE_TOKEN"] = "already-exported"
+    try:
+        load_dotenv(env_path)
+    finally:
+        env_path.unlink()
+    assert os.environ["PVE_HOST"] == "pve9.example.com:443", os.environ["PVE_HOST"]
+    assert os.environ["PVE_TOKEN"] == "already-exported"  # shell wins over the file
+    assert os.environ["PVE_INSECURE"] == "1"
+    load_dotenv(Path("/nonexistent/.env"))  # missing file is not an error
+
+    print(f"selftest ok ({len(cases) + len(urls) + 3} cases)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
