@@ -26,6 +26,11 @@ running VM. That is the only way to learn whether the guest's balloon driver is
 actually loaded, and it is also the slow path: a wedged VM stalls the whole node's
 answer. Off by default.
 
+`--ips` adds the public-IP column. vmstatus carries no address at all, so this costs
+one extra call per RUNNING VM against the qemu-guest-agent
+(`/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces`); a VM without the agent
+answers with an error and gets a blank cell. Off by default for that reason.
+
 Config comes from a `.env` beside this file (see .env.example): PVE_HOST
 ("pve1", "pve1:443", "https://pve.example.com"; port defaults to 8006),
 PVE_TOKEN ("user@realm!tokenid=uuid"), optional PVE_INSECURE=1.
@@ -34,6 +39,7 @@ PVE_TOKEN ("user@realm!tokenid=uuid"), optional PVE_INSECURE=1.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import ssl
@@ -124,6 +130,29 @@ def classify(vm: dict) -> tuple[str, str]:
     return "yes", f"{floor // MIB}-{maxmem // MIB} MiB, shares={shares if shares is not None else 1000}"
 
 
+def public_ip(get, node: str, vmid: int) -> str:
+    """First globally routable address qemu-guest-agent reports for this VM, else "".
+
+    `is_global` is the whole filter: it already excludes loopback, link-local, RFC1918,
+    CGNAT and IPv6 ULA, so there is no private-range list to keep in sync here.
+    An empty cell means "no answer" (agent missing, stopped, or firewalled), NOT
+    "this VM has no public address" -- the agent is the only source and it can be absent.
+    """
+    try:
+        data = get(f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces")
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return ""
+    for iface in (data or {}).get("result", []):
+        for addr in iface.get("ip-addresses", []):
+            try:
+                ip = ipaddress.ip_address(addr.get("ip-address", ""))
+            except ValueError:
+                continue
+            if ip.is_global:
+                return str(ip)
+    return ""
+
+
 def main() -> int:
     load_dotenv()
     ap = argparse.ArgumentParser(description=__doc__)
@@ -136,6 +165,11 @@ def main() -> int:
         help="skip TLS verification (or PVE_INSECURE=1)",
     )
     ap.add_argument("--full", action="store_true", help="QMP query per running VM (slow)")
+    ap.add_argument(
+        "--ips",
+        action="store_true",
+        help="add the public IP column (1 guest-agent call per running VM)",
+    )
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--only", default="", help="print only this verdict, e.g. --only yes")
     ap.add_argument("--out", help="write the report to this file (progress still goes to stderr)")
@@ -183,12 +217,16 @@ def main() -> int:
             unreachable.append(f"{name} ({exc})")
             continue
         log(f"{tag}: {len(vms)} VM(s) in {time.monotonic() - t:.1f}s")
+        t = time.monotonic()
         for vm in vms:
             if vm.get("template"):
                 continue
             if args.full:
                 vm["full"] = True
             verdict, why = classify(vm)
+            # A stopped VM has no agent to ask, so skip the call instead of paying a
+            # timeout per powered-off VM.
+            ip = public_ip(get, name, vm["vmid"]) if args.ips and vm.get("status") == "running" else ""
             rows.append(
                 {
                     "node": name,
@@ -199,9 +237,12 @@ def main() -> int:
                     "floor_mib": (vm.get("balloon_min") or 0) // MIB or None,
                     "shares": vm.get("shares"),
                     "ballooning": verdict,
+                    "public_ip": ip,
                     "why": why,
                 }
             )
+        if args.ips:
+            log(f"{tag}: guest-agent IPs in {time.monotonic() - t:.1f}s")
 
     if args.only:
         rows = [r for r in rows if r["ballooning"] == args.only]
@@ -212,10 +253,23 @@ def main() -> int:
         if args.json:
             print(json.dumps({"vms": rows, "unreachable": unreachable}, indent=2), file=out)
         else:
+            # The header says which cluster and when, because a saved report outlives the
+            # shell that produced it and "which run was this?" is otherwise unanswerable.
+            print(
+                f"# pve-balloon  host={args.host}  {time.strftime('%Y-%m-%d %H:%M:%S%z')}  "
+                f"nodes={len(nodes)}  full={'yes' if args.full else 'no'}"
+                + (f"  only={args.only}" if args.only else ""),
+                file=out,
+            )
+            head = f"{'NODE':<12} {'VMID':>6}  {'NAME':<24} {'STATUS':<8} {'BALLOON':<9} "
+            if args.ips:
+                head += f"{'PUBLIC IP':<15} "
+            print(head + "WHY", file=out)
             for r in rows:
+                ip = f"{r['public_ip'] or '-':<15} " if args.ips else ""
                 print(
                     f"{r['node']:<12} {r['vmid']:>6}  {r['name'][:24]:<24} "
-                    f"{r['status']:<8} {r['ballooning']:<9} {r['why']}",
+                    f"{r['status']:<8} {r['ballooning']:<9} {ip}{r['why']}",
                     file=out,
                 )
             print(f"\n{len(rows)} VM(s) listed.", file=out)
@@ -262,6 +316,33 @@ def selftest() -> int:
         got, why = classify(vm)
         assert got == want, f"{vm} -> {got!r} ({why}), want {want!r}"
 
+    def agent(result):
+        def get(_path):
+            if isinstance(result, Exception):
+                raise result
+            return {"result": result}
+
+        return get
+
+    ips = [
+        ([{"ip-addresses": [{"ip-address": "203.0.113.7"}]}], ""),  # TEST-NET-3 is not global
+        ([{"ip-addresses": [{"ip-address": "8.8.4.4"}]}], "8.8.4.4"),
+        (
+            [
+                {"ip-addresses": [{"ip-address": "127.0.0.1"}, {"ip-address": "::1"}]},
+                {"ip-addresses": [{"ip-address": "192.168.1.5"}, {"ip-address": "2606:4700::1"}]},
+            ],
+            "2606:4700::1",
+        ),
+        ([{"ip-addresses": [{"ip-address": "100.64.0.1"}, {"ip-address": "fe80::1"}]}], ""),
+        ([{"ip-addresses": [{"ip-address": "not-an-ip"}, {"ip-address": "1.1.1.1"}]}], "1.1.1.1"),
+        ([], ""),
+        (urllib.error.URLError("agent not running"), ""),  # no agent -> blank, not a crash
+    ]
+    for result, want in ips:
+        got = public_ip(agent(result), "pve1", 100)
+        assert got == want, f"{result} -> {got!r}, want {want!r}"
+
     urls = [
         ("pve1", "https://pve1:8006"),
         ("pve1:443", "https://pve1:443"),
@@ -294,7 +375,7 @@ def selftest() -> int:
     assert os.environ["PVE_INSECURE"] == "1"
     load_dotenv(Path("/nonexistent/.env"))  # missing file is not an error
 
-    print(f"selftest ok ({len(cases) + len(urls) + 3} cases)")
+    print(f"selftest ok ({len(cases) + len(ips) + len(urls) + 3} cases)")
     return 0
 
 

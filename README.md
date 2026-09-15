@@ -107,12 +107,22 @@ python3 pve_balloon.py                  # every VM, every verdict
 python3 pve_balloon.py --only yes       # just the ones pvestatd actually manages
 python3 pve_balloon.py --json           # machine-readable, includes unreachable nodes
 python3 pve_balloon.py --full           # adds the runtime guest-driver check (slow)
+python3 pve_balloon.py --ips            # adds the PUBLIC IP column (guest agent, slow)
 python3 pve_balloon.py --only yes --out ballooning.txt
 ```
 
 Per-node progress (`[2/5] pve2: fetching...` and how long each node took) goes to stderr, so
 `--out FILE` — or a plain `> FILE` — keeps the report clean while you still watch it work, and
 the timings tell you which node is the slow one.
+
+The text report opens with a header naming the cluster, the run time and the flags, then the
+column names — a saved report outlives the shell that produced it:
+
+```
+# pve-balloon  host=pve1  2026-09-15 14:02:11+0700  nodes=5  full=no
+NODE           VMID  NAME                     STATUS   BALLOON   PUBLIC IP       WHY
+pve1            101  web-01                   running  yes       203.0.113.10    2048-8192 MiB, shares=1000
+```
 
 Verdicts:
 
@@ -147,6 +157,13 @@ could not reach is a gap in the answer, not evidence of absence.
 - Behind a reverse proxy, `--full` can trip the proxy's own read timeout (nginx defaults to 60
   seconds) and hand you a `504` that has nothing to do with Proxmox. Raise it there, or run
   `--full` one node at a time.
+- `--ips` is opt-in for the same reason, and it is the more expensive of the two: `vmstatus`
+  carries no address, so the only source is one
+  `/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces` call per **running** VM. Stopped VMs
+  are skipped. The column holds the first globally routable address the agent reports; loopback,
+  link-local, RFC1918, CGNAT and IPv6 ULA are filtered out. A `-` means the agent gave no
+  answer — not installed, not running, or blocked — which is a missing answer, not proof the VM
+  has no public address.
 
 ## Fallback: read pmxcfs directly
 
