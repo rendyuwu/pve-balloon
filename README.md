@@ -164,6 +164,11 @@ could not reach is a gap in the answer, not evidence of absence.
   link-local, RFC1918, CGNAT and IPv6 ULA are filtered out. A `-` means the agent gave no
   answer — not installed, not running, or blocked — which is a missing answer, not proof the VM
   has no public address.
+- There is no built-in sleep, because the script is sequential: `urlopen` blocks, so exactly one
+  request is ever in flight and the next agent call only starts once the previous one answered.
+  The pacing is the guest agent's own latency. If your cluster still feels it — many running VMs
+  with fast-answering agents — `--delay 0.1` pauses after each agent call. It applies to `--ips`
+  only; the node calls are one per node and not worth spacing.
 
 ## Fallback: read pmxcfs directly
 

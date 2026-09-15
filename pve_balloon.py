@@ -170,6 +170,13 @@ def main() -> int:
         action="store_true",
         help="add the public IP column (1 guest-agent call per running VM)",
     )
+    ap.add_argument(
+        "--delay",
+        type=float,
+        default=0.0,
+        help="seconds to pause after each --ips guest-agent call (default 0: requests are "
+        "sequential already, so the next one only starts once the last answered)",
+    )
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--only", default="", help="print only this verdict, e.g. --only yes")
     ap.add_argument("--out", help="write the report to this file (progress still goes to stderr)")
@@ -226,7 +233,14 @@ def main() -> int:
             verdict, why = classify(vm)
             # A stopped VM has no agent to ask, so skip the call instead of paying a
             # timeout per powered-off VM.
-            ip = public_ip(get, name, vm["vmid"]) if args.ips and vm.get("status") == "running" else ""
+            ip = ""
+            if args.ips and vm.get("status") == "running":
+                ip = public_ip(get, name, vm["vmid"])
+                # Nothing here runs in parallel, so the pause is only for a cluster where
+                # back-to-back agent calls are measurably in the way of pveproxy's three
+                # workers. Left as a knob because that threshold is per-cluster.
+                if args.delay:
+                    time.sleep(args.delay)
             rows.append(
                 {
                     "node": name,
